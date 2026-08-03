@@ -1,23 +1,32 @@
 name: Build Rust Engine
+
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Extract source
         shell: pwsh
-        run: Expand-Archive engine/rust_source.zip engine/build
+        run: Expand-Archive engine/rust_source.zip engine/build -Force
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
       - name: Build
         working-directory: engine/build/rust
         run: cargo build --release --target x86_64-pc-windows-msvc
+
       - uses: actions/upload-artifact@v4
         with:
           name: mn_nesting_engine_windows_x64
           path: engine/build/rust/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
+          if-no-files-found: error
