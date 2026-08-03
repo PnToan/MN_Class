@@ -1,0 +1,161 @@
+name: Build Rust Engine v0.1.1
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore source
+        shell: pwsh
+        run: |
+          $encoded = (1..6 | ForEach-Object { Get-Content -Raw ("engine/rust_source_optimized_001.part{0:D2}" -f $_) }) -join ''
+          [IO.File]::WriteAllBytes('engine/rust_source.zip', [Convert]::FromBase64String($encoded.Trim()))
+          Expand-Archive engine/rust_source.zip engine/build -Force
+
+      - name: Apply dense-grid and CDE-margin fixes
+        shell: pwsh
+        run: |
+          $path = 'engine/build/rust/src/engine.rs'
+          $source = Get-Content -Raw $path
+
+          # Jagua applies half separation to the item and half to the container.
+          # The original contour therefore needs edge_margin + the full cut gap.
+          $source = $source.Replace('let margin = cfg.edge_margin;', 'let margin = cfg.edge_margin + cfg.cut_gap + 0.01;')
+
+          $candidateNeedle = '        let mut x_anchors = vec![margin, max_x];'
+          $candidateInsert = @'
+                  let pitch_x = orientation.width + separation;
+                  let pitch_y = orientation.height + separation;
+                  if pitch_x > 0.0 && pitch_y > 0.0 {
+                      let columns = (((max_x - margin) / pitch_x).floor() as usize).saturating_add(1);
+                      let rows = (((max_y - margin) / pitch_y).floor() as usize).saturating_add(1);
+                      for row in 0..rows {
+                          for column in 0..columns {
+                              push_candidate(&mut out, &mut seen, orientation_index,
+                                  margin + column as f64 * pitch_x,
+                                  margin + row as f64 * pitch_y,
+                                  margin, max_x, max_y, orientation_limit, orientation_start);
+                          }
+                      }
+                  }
+
+                  let mut x_anchors = vec![margin, max_x];
+          '@.Trim()
+          if (-not $source.Contains($candidateNeedle)) { throw 'Candidate insertion point not found' }
+          $source = $source.Replace($candidateNeedle, $candidateInsert)
+
+          # Repeated true rectangles use a deterministic grid preference. Irregular
+          # parts and isolated rectangles remain on the generic Jagua search path.
+          $scoreNeedle = '    let mut score = vec![opening_sheet, two_sided_sheet];'
+          $scoreInsert = @'
+              let moving_part = &parts[part_index].part;
+              let rectangle_area = moving_part.width * moving_part.height;
+              let is_true_rectangle = !moving_part.special_shape
+                  && moving_part.holes.is_empty()
+                  && moving_part.contour.len() == 4
+                  && (moving_part.area - rectangle_area).abs()
+                      <= rectangle_area.abs().max(1.0) * 0.005;
+              let repeated_rectangle = is_true_rectangle
+                  && parts
+                      .iter()
+                      .filter(|candidate| {
+                          let part = &candidate.part;
+                          !part.special_shape
+                              && part.holes.is_empty()
+                              && part.contour.len() == 4
+                              && (part.width - moving_part.width).abs() < 0.01
+                              && (part.height - moving_part.height).abs() < 0.01
+                              && (part.area - moving_part.area).abs() < 0.1
+                      })
+                      .take(3)
+                      .count()
+                      >= 3;
+              let (grid_penalty, rotation_penalty) = if repeated_rectangle {
+                  let margin = cfg.edge_margin + cfg.cut_gap + 0.01;
+                  let pitch_x = orientation.width + cfg.cut_gap + 0.05;
+                  let pitch_y = orientation.height + cfg.cut_gap + 0.05;
+                  let grid_x = ((x - margin) / pitch_x).round();
+                  let grid_y = ((y - margin) / pitch_y).round();
+                  let error = (x - (margin + grid_x * pitch_x)).abs()
+                      + (y - (margin + grid_y * pitch_y)).abs();
+                  (scaled(error), orientation_index as i64)
+              } else {
+                  (0, 0)
+              };
+
+              let mut score = vec![
+                  opening_sheet,
+                  two_sided_sheet,
+                  grid_penalty,
+                  rotation_penalty,
+              ];
+          '@.Trim()
+          if (-not $source.Contains($scoreNeedle)) { throw 'Score insertion point not found' }
+          $source = $source.Replace($scoreNeedle, $scoreInsert)
+
+          [IO.File]::WriteAllText($path, $source, [Text.UTF8Encoding]::new($false))
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        working-directory: engine/build/rust
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Verify one-sheet 80-percent benchmark
+        shell: pwsh
+        working-directory: engine/build/rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'mn_nesting_v011'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $parts = 0..23 | ForEach-Object {
+            @{
+              entity_id="part-$_"; order=$_;
+              contour=@(@(0,0),@(150,0),@(150,112),@(0,112)); holes=@();
+              area=16800.0; width=150.0; height=112.0; base_rotation_degrees=0.0;
+              two_sided=($_ -lt 4); special_shape=$false
+            }
+          }
+          $job = @{
+            protocol_version=2; source='v011-benchmark'; optimization_attempts=8;
+            materials=@(@{
+              key='MDF18'; material='MDF 18'; thickness=18.0; group_index=0; original_part_count=24;
+              configuration=@{
+                board_width=1000.0; board_height=500.0; edge_margin=10.0; cut_gap=5.0;
+                rotation_divisions=4; sheet_in_sheet=$false; priority_zone_nesting=$true;
+                optimize_flip_face=$true; compact_directions=@('left','bottom'); max_nesting_time_ms=60000
+              };
+              parts=$parts
+            })
+          }
+          $jobPath=Join-Path $dir 'job.json'; $resultPath=Join-Path $dir 'result.json'
+          $progressPath=Join-Path $dir 'progress.json'; $previewPath=Join-Path $dir 'preview.json'
+          $svgPath=Join-Path $dir 'result.svg'; $cancelPath=Join-Path $dir 'cancel.flag'
+          $job | ConvertTo-Json -Depth 12 -Compress | Set-Content -Encoding utf8NoBOM $jobPath
+          $exe=Resolve-Path 'target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe'
+          & $exe --job $jobPath --result $resultPath --progress $progressPath --preview $previewPath --svg $svgPath --cancel $cancelPath --workers 2
+          if ($LASTEXITCODE -ne 0) { throw "Engine exit $LASTEXITCODE" }
+          $rawResult = Get-Content -Raw $resultPath
+          Write-Host $rawResult
+          $result=$rawResult | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Result not ok' }
+          if ($result.layouts[0].sheets.Count -ne 1) { throw "Expected 1 sheet, got $($result.layouts[0].sheets.Count)" }
+          if ($result.layouts[0].sheets[0].placements.Count -ne 24) { throw 'Missing placements' }
+          if ($result.layouts[0].used_percent -lt 80.0) { throw "Utilization $($result.layouts[0].used_percent)%" }
+          if (($result.layouts[0].sheets[0].placements | Select-Object -First 4 | Where-Object { -not $_.two_sided }).Count -ne 0) { throw 'Two-sided priority failed' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mn_nesting_engine_windows_x64_v011
+          path: engine/build/rust/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
+          if-no-files-found: error
