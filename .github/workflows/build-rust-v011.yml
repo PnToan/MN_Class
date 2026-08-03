@@ -25,12 +25,13 @@ jobs:
         run: |
           $path = 'engine/build/rust/src/engine.rs'
           $source = Get-Content -Raw $path
+
           # Jagua applies half separation to the item and half to the container.
-          # Because the usable container already begins at edge_margin, an original
-          # part contour needs edge_margin + the full cut gap to remain feasible.
+          # The original contour therefore needs edge_margin + the full cut gap.
           $source = $source.Replace('let margin = cfg.edge_margin;', 'let margin = cfg.edge_margin + cfg.cut_gap + 0.01;')
-          $needle = '        let mut x_anchors = vec![margin, max_x];'
-          $insert = @'
+
+          $candidateNeedle = '        let mut x_anchors = vec![margin, max_x];'
+          $candidateInsert = @'
                   let pitch_x = orientation.width + separation;
                   let pitch_y = orientation.height + separation;
                   if pitch_x > 0.0 && pitch_y > 0.0 {
@@ -48,8 +49,58 @@ jobs:
 
                   let mut x_anchors = vec![margin, max_x];
           '@.Trim()
-          if (-not $source.Contains($needle)) { throw 'Candidate insertion point not found' }
-          $source = $source.Replace($needle, $insert)
+          if (-not $source.Contains($candidateNeedle)) { throw 'Candidate insertion point not found' }
+          $source = $source.Replace($candidateNeedle, $candidateInsert)
+
+          # Repeated true rectangles use a deterministic grid preference. Irregular
+          # parts and isolated rectangles remain on the generic Jagua search path.
+          $scoreNeedle = '    let mut score = vec![opening_sheet, two_sided_sheet];'
+          $scoreInsert = @'
+              let moving_part = &parts[part_index].part;
+              let rectangle_area = moving_part.width * moving_part.height;
+              let is_true_rectangle = !moving_part.special_shape
+                  && moving_part.holes.is_empty()
+                  && moving_part.contour.len() == 4
+                  && (moving_part.area - rectangle_area).abs()
+                      <= rectangle_area.abs().max(1.0) * 0.005;
+              let repeated_rectangle = is_true_rectangle
+                  && parts
+                      .iter()
+                      .filter(|candidate| {
+                          let part = &candidate.part;
+                          !part.special_shape
+                              && part.holes.is_empty()
+                              && part.contour.len() == 4
+                              && (part.width - moving_part.width).abs() < 0.01
+                              && (part.height - moving_part.height).abs() < 0.01
+                              && (part.area - moving_part.area).abs() < 0.1
+                      })
+                      .take(3)
+                      .count()
+                      >= 3;
+              let (grid_penalty, rotation_penalty) = if repeated_rectangle {
+                  let margin = cfg.edge_margin + cfg.cut_gap + 0.01;
+                  let pitch_x = orientation.width + cfg.cut_gap + 0.05;
+                  let pitch_y = orientation.height + cfg.cut_gap + 0.05;
+                  let grid_x = ((x - margin) / pitch_x).round();
+                  let grid_y = ((y - margin) / pitch_y).round();
+                  let error = (x - (margin + grid_x * pitch_x)).abs()
+                      + (y - (margin + grid_y * pitch_y)).abs();
+                  (scaled(error), orientation_index as i64)
+              } else {
+                  (0, 0)
+              };
+
+              let mut score = vec![
+                  opening_sheet,
+                  two_sided_sheet,
+                  grid_penalty,
+                  rotation_penalty,
+              ];
+          '@.Trim()
+          if (-not $source.Contains($scoreNeedle)) { throw 'Score insertion point not found' }
+          $source = $source.Replace($scoreNeedle, $scoreInsert)
+
           [IO.File]::WriteAllText($path, $source, [Text.UTF8Encoding]::new($false))
 
       - uses: dtolnay/rust-toolchain@stable
