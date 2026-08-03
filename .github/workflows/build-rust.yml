@@ -27,6 +27,47 @@ jobs:
         shell: pwsh
         run: Expand-Archive engine/rust_source.zip engine/build -Force
 
+      - name: Add deterministic dense-grid candidates
+        shell: pwsh
+        run: |
+          $path = 'engine/build/rust/src/engine.rs'
+          $source = Get-Content -Raw $path
+          $needle = @'
+                  let mut x_anchors = vec![margin, max_x];
+          '@.Trim()
+          $replacement = @'
+                  // Dense deterministic shelf/grid candidates are evaluated before
+                  // contact-heavy candidates so regular parts cannot miss a feasible
+                  // high-utilization row/column pattern when the generic budget fills.
+                  let pitch_x = orientation.width + separation;
+                  let pitch_y = orientation.height + separation;
+                  if pitch_x > 0.0 && pitch_y > 0.0 {
+                      let columns = (((max_x - margin) / pitch_x).floor() as usize).saturating_add(1);
+                      let rows = (((max_y - margin) / pitch_y).floor() as usize).saturating_add(1);
+                      for row in 0..rows {
+                          for column in 0..columns {
+                              push_candidate(
+                                  &mut out,
+                                  &mut seen,
+                                  orientation_index,
+                                  margin + column as f64 * pitch_x,
+                                  margin + row as f64 * pitch_y,
+                                  margin,
+                                  max_x,
+                                  max_y,
+                                  orientation_limit,
+                                  orientation_start,
+                              );
+                          }
+                      }
+                  }
+
+                  let mut x_anchors = vec![margin, max_x];
+          '@.Trim()
+          if (-not $source.Contains($needle)) { throw 'Candidate insertion point not found' }
+          $source = $source.Replace($needle, $replacement)
+          [System.IO.File]::WriteAllText($path, $source, [System.Text.UTF8Encoding]::new($false))
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -112,6 +153,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mn_nesting_engine_windows_x64_optimized_001
+          name: mn_nesting_engine_windows_x64_optimized_002
           path: engine/build/rust/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
           if-no-files-found: error
