@@ -18,7 +18,9 @@ jobs:
       - name: Decode optimized source
         shell: pwsh
         run: |
-          $encoded = Get-Content -Raw engine/rust_source_optimized_001.b64
+          $encoded = (1..6 | ForEach-Object {
+            Get-Content -Raw ("engine/rust_source_optimized_001.part{0:D2}" -f $_)
+          }) -join ''
           [System.IO.File]::WriteAllBytes('engine/rust_source.zip', [Convert]::FromBase64String($encoded.Trim()))
 
       - name: Extract source
