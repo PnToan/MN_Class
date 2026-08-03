@@ -15,6 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Decode optimized source
+        shell: pwsh
+        run: |
+          $encoded = Get-Content -Raw engine/rust_source_optimized_001.b64
+          [System.IO.File]::WriteAllBytes('engine/rust_source.zip', [Convert]::FromBase64String($encoded.Trim()))
+
       - name: Extract source
         shell: pwsh
         run: Expand-Archive engine/rust_source.zip engine/build -Force
@@ -27,7 +33,7 @@ jobs:
         working-directory: engine/build/rust
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Smoke test engine protocol
+      - name: Smoke test engine protocol and 80 percent target
         shell: pwsh
         working-directory: engine/build/rust
         run: |
@@ -40,61 +46,49 @@ jobs:
           $previewPath = Join-Path $testDir 'preview.json'
           $svgPath = Join-Path $testDir 'result.svg'
           $cancelPath = Join-Path $testDir 'cancel.flag'
-          $job = @'
-          {
-            "protocol_version": 2,
-            "source": "github-actions-smoke",
-            "optimization_attempts": 8,
-            "materials": [
-              {
-                "key": "MDF18",
-                "material": "MDF 18",
-                "thickness": 18.0,
-                "group_index": 0,
-                "original_part_count": 2,
-                "configuration": {
-                  "board_width": 1000.0,
-                  "board_height": 500.0,
-                  "edge_margin": 10.0,
-                  "cut_gap": 5.0,
-                  "rotation_divisions": 4,
-                  "sheet_in_sheet": false,
-                  "priority_zone_nesting": true,
-                  "optimize_flip_face": true,
-                  "compact_directions": ["left", "bottom"],
-                  "max_nesting_time_ms": 10000
-                },
-                "parts": [
-                  {
-                    "entity_id": "two-sided",
-                    "order": 0,
-                    "contour": [[0,0],[200,0],[200,100],[0,100]],
-                    "holes": [],
-                    "area": 20000.0,
-                    "width": 200.0,
-                    "height": 100.0,
-                    "base_rotation_degrees": 0.0,
-                    "two_sided": true,
-                    "special_shape": false
-                  },
-                  {
-                    "entity_id": "normal",
-                    "order": 1,
-                    "contour": [[0,0],[150,0],[150,80],[0,80]],
-                    "holes": [],
-                    "area": 12000.0,
-                    "width": 150.0,
-                    "height": 80.0,
-                    "base_rotation_degrees": 0.0,
-                    "two_sided": false,
-                    "special_shape": false
-                  }
-                ]
-              }
-            ]
+
+          $parts = @()
+          for ($i = 0; $i -lt 24; $i++) {
+            $parts += @{
+              entity_id = "part-$i"
+              order = $i
+              contour = @(@(0,0), @(150,0), @(150,112), @(0,112))
+              holes = @()
+              area = 16800.0
+              width = 150.0
+              height = 112.0
+              base_rotation_degrees = 0.0
+              two_sided = ($i -lt 4)
+              special_shape = $false
+            }
           }
-          '@
-          [System.IO.File]::WriteAllText($jobPath, $job, [System.Text.UTF8Encoding]::new($false))
+          $jobObject = @{
+            protocol_version = 2
+            source = 'github-actions-utilization-smoke'
+            optimization_attempts = 8
+            materials = @(@{
+              key = 'MDF18'
+              material = 'MDF 18'
+              thickness = 18.0
+              group_index = 0
+              original_part_count = 24
+              configuration = @{
+                board_width = 1000.0
+                board_height = 500.0
+                edge_margin = 10.0
+                cut_gap = 5.0
+                rotation_divisions = 4
+                sheet_in_sheet = $false
+                priority_zone_nesting = $true
+                optimize_flip_face = $true
+                compact_directions = @('left','bottom')
+                max_nesting_time_ms = 60000
+              }
+              parts = $parts
+            })
+          }
+          $jobObject | ConvertTo-Json -Depth 12 -Compress | Set-Content -Encoding utf8NoBOM $jobPath
+
           $exe = Resolve-Path 'target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe'
           & $exe --job $jobPath --result $resultPath --progress $progressPath --preview $previewPath --svg $svgPath --cancel $cancelPath --workers 2
           if ($LASTEXITCODE -ne 0) { throw "Engine exited with code $LASTEXITCODE" }
@@ -103,16 +97,19 @@ jobs:
           }
           $result = Get-Content -Raw $resultPath | ConvertFrom-Json
           if (-not $result.ok) { throw 'Engine result is not ok' }
-          if ($result.engine_version -ne '0.1.0') { throw 'Unexpected engine version' }
+          if ($result.engine_version -ne '0.1.1') { throw 'Unexpected engine version' }
           if ($result.layouts.Count -ne 1) { throw 'Expected one material layout' }
-          if ($result.layouts[0].sheets.Count -ne 1) { throw 'Expected one sheet for smoke test' }
-          if ($result.layouts[0].sheets[0].placements.Count -ne 2) { throw 'Expected two placements' }
-          if ($result.layouts[0].sheets[0].placements[0].entity_id -ne 'two-sided') { throw 'Two-sided part was not prioritized' }
+          if ($result.layouts[0].sheets.Count -ne 1) { throw "Expected one sheet, got $($result.layouts[0].sheets.Count)" }
+          if ($result.layouts[0].sheets[0].placements.Count -ne 24) { throw 'Expected 24 placements' }
+          if ($result.layouts[0].used_percent -lt 80.0) { throw "Expected utilization >= 80%, got $($result.layouts[0].used_percent)" }
+          for ($i = 0; $i -lt 4; $i++) {
+            if ($result.layouts[0].sheets[0].placements[$i].two_sided -ne $true) { throw 'Two-sided parts were not prioritized' }
+          }
           $progress = Get-Content -Raw $progressPath | ConvertFrom-Json
           if ($progress.running -ne $false -or $progress.overall_percent -ne 100) { throw 'Progress did not complete cleanly' }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mn_nesting_engine_windows_x64_static
+          name: mn_nesting_engine_windows_x64_optimized_001
           path: engine/build/rust/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
           if-no-files-found: error
