@@ -10,6 +10,8 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
 
@@ -111,6 +113,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mn_nesting_engine_windows_x64
+          name: mn_nesting_engine_windows_x64_static
           path: engine/build/rust/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
           if-no-files-found: error
