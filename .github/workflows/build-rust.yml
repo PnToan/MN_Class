@@ -25,6 +25,90 @@ jobs:
         working-directory: engine/build/rust
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      - name: Smoke test engine protocol
+        shell: pwsh
+        working-directory: engine/build/rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testDir = Join-Path $env:RUNNER_TEMP 'mn_nesting_smoke'
+          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+          $jobPath = Join-Path $testDir 'job.json'
+          $resultPath = Join-Path $testDir 'result.json'
+          $progressPath = Join-Path $testDir 'progress.json'
+          $previewPath = Join-Path $testDir 'preview.json'
+          $svgPath = Join-Path $testDir 'result.svg'
+          $cancelPath = Join-Path $testDir 'cancel.flag'
+          $job = @'
+          {
+            "protocol_version": 2,
+            "source": "github-actions-smoke",
+            "optimization_attempts": 8,
+            "materials": [
+              {
+                "key": "MDF18",
+                "material": "MDF 18",
+                "thickness": 18.0,
+                "group_index": 0,
+                "original_part_count": 2,
+                "configuration": {
+                  "board_width": 1000.0,
+                  "board_height": 500.0,
+                  "edge_margin": 10.0,
+                  "cut_gap": 5.0,
+                  "rotation_divisions": 4,
+                  "sheet_in_sheet": false,
+                  "priority_zone_nesting": true,
+                  "optimize_flip_face": true,
+                  "compact_directions": ["left", "bottom"],
+                  "max_nesting_time_ms": 10000
+                },
+                "parts": [
+                  {
+                    "entity_id": "two-sided",
+                    "order": 0,
+                    "contour": [[0,0],[200,0],[200,100],[0,100]],
+                    "holes": [],
+                    "area": 20000.0,
+                    "width": 200.0,
+                    "height": 100.0,
+                    "base_rotation_degrees": 0.0,
+                    "two_sided": true,
+                    "special_shape": false
+                  },
+                  {
+                    "entity_id": "normal",
+                    "order": 1,
+                    "contour": [[0,0],[150,0],[150,80],[0,80]],
+                    "holes": [],
+                    "area": 12000.0,
+                    "width": 150.0,
+                    "height": 80.0,
+                    "base_rotation_degrees": 0.0,
+                    "two_sided": false,
+                    "special_shape": false
+                  }
+                ]
+              }
+            ]
+          }
+          '@
+          [System.IO.File]::WriteAllText($jobPath, $job, [System.Text.UTF8Encoding]::new($false))
+          $exe = Resolve-Path 'target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe'
+          & $exe --job $jobPath --result $resultPath --progress $progressPath --preview $previewPath --svg $svgPath --cancel $cancelPath --workers 2
+          if ($LASTEXITCODE -ne 0) { throw "Engine exited with code $LASTEXITCODE" }
+          foreach ($path in @($resultPath, $progressPath, $previewPath, $svgPath)) {
+            if (-not (Test-Path $path)) { throw "Missing smoke-test output: $path" }
+          }
+          $result = Get-Content -Raw $resultPath | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Engine result is not ok' }
+          if ($result.engine_version -ne '0.1.0') { throw 'Unexpected engine version' }
+          if ($result.layouts.Count -ne 1) { throw 'Expected one material layout' }
+          if ($result.layouts[0].sheets.Count -ne 1) { throw 'Expected one sheet for smoke test' }
+          if ($result.layouts[0].sheets[0].placements.Count -ne 2) { throw 'Expected two placements' }
+          if ($result.layouts[0].sheets[0].placements[0].entity_id -ne 'two-sided') { throw 'Two-sided part was not prioritized' }
+          $progress = Get-Content -Raw $progressPath | ConvertFrom-Json
+          if ($progress.running -ne $false -or $progress.overall_percent -ne 100) { throw 'Progress did not complete cleanly' }
+
       - uses: actions/upload-artifact@v4
         with:
           name: mn_nesting_engine_windows_x64
