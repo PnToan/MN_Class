@@ -1,0 +1,19 @@
+[package]
+name = "mn_nesting_engine"
+version = "0.1.0"
+edition = "2024"
+license = "Proprietary"
+description = "Isolated Rust nesting engine for MN_Class_Gcode"
+
+[dependencies]
+anyhow = "1.0"
+jagua-rs = { version = "=0.7.2", features = ["bpp"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
