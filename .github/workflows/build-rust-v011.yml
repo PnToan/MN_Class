@@ -25,7 +25,10 @@ jobs:
         run: |
           $path = 'engine/build/rust/src/engine.rs'
           $source = Get-Content -Raw $path
-          $source = $source.Replace('let margin = cfg.edge_margin;', 'let margin = cfg.edge_margin + cfg.cut_gap * 0.5 + 0.01;')
+          # Jagua applies half separation to the item and half to the container.
+          # Because the usable container already begins at edge_margin, an original
+          # part contour needs edge_margin + the full cut gap to remain feasible.
+          $source = $source.Replace('let margin = cfg.edge_margin;', 'let margin = cfg.edge_margin + cfg.cut_gap + 0.01;')
           $needle = '        let mut x_anchors = vec![margin, max_x];'
           $insert = @'
                   let pitch_x = orientation.width + separation;
@@ -91,7 +94,9 @@ jobs:
           $exe=Resolve-Path 'target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe'
           & $exe --job $jobPath --result $resultPath --progress $progressPath --preview $previewPath --svg $svgPath --cancel $cancelPath --workers 2
           if ($LASTEXITCODE -ne 0) { throw "Engine exit $LASTEXITCODE" }
-          $result=Get-Content -Raw $resultPath | ConvertFrom-Json
+          $rawResult = Get-Content -Raw $resultPath
+          Write-Host $rawResult
+          $result=$rawResult | ConvertFrom-Json
           if (-not $result.ok) { throw 'Result not ok' }
           if ($result.layouts[0].sheets.Count -ne 1) { throw "Expected 1 sheet, got $($result.layouts[0].sheets.Count)" }
           if ($result.layouts[0].sheets[0].placements.Count -ne 24) { throw 'Missing placements' }
