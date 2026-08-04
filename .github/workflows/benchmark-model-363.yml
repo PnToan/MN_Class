@@ -25,8 +25,7 @@ jobs:
 
       - name: Apply adaptive mixed-family optimizer
         shell: pwsh
-        working-directory: engine/build/work012
-        run: git apply --whitespace=nowarn ../../patches/adaptive_family_012.patch
+        run: git apply --whitespace=nowarn --directory=engine/build/work012 -p0 engine/patches/adaptive_family_012.patch
 
       - uses: dtolnay/rust-toolchain@stable
         with:
