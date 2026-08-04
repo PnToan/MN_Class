@@ -14,57 +14,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore Rust source
+      - name: Restore Rust 0.1.2 source
         shell: pwsh
-        run: |
-          $encoded = (1..6 | ForEach-Object { Get-Content -Raw ("engine/rust_source_optimized_001.part{0:D2}" -f $_) }) -join ''
-          [IO.File]::WriteAllBytes('engine/rust_source.zip', [Convert]::FromBase64String($encoded.Trim()))
-          Expand-Archive engine/rust_source.zip engine/build -Force
-
-      - name: Apply released 0.1.1 patches
-        shell: pwsh
-        run: |
-          $path = 'engine/build/rust/src/engine.rs'
-          $source = Get-Content -Raw $path
-          $source = $source.Replace('let margin = cfg.edge_margin;', 'let margin = cfg.edge_margin + cfg.cut_gap + 0.01;')
-          $needle = '        let mut x_anchors = vec![margin, max_x];'
-          $insert = @'
-          let pitch_x = orientation.width + separation;
-          let pitch_y = orientation.height + separation;
-          if pitch_x > 0.0 && pitch_y > 0.0 {
-              let columns = (((max_x - margin) / pitch_x).floor() as usize).saturating_add(1);
-              let rows = (((max_y - margin) / pitch_y).floor() as usize).saturating_add(1);
-              for row in 0..rows {
-                  for column in 0..columns {
-                      push_candidate(&mut out, &mut seen, orientation_index,
-                          margin + column as f64 * pitch_x,
-                          margin + row as f64 * pitch_y,
-                          margin, max_x, max_y, orientation_limit, orientation_start);
-                  }
-              }
-          }
-
-          let mut x_anchors = vec![margin, max_x];
-          '@.Trim()
-          if (-not $source.Contains($needle)) { throw 'Candidate insertion point not found' }
-          $source = $source.Replace($needle, $insert)
-          $source = $source.Replace('let mut score = vec![opening_sheet, two_sided_sheet];', 'let grid_x = ((x - margin) / (orientation.width + cfg.cut_gap + 0.05)).round();`n    let grid_y = ((y - margin) / (orientation.height + cfg.cut_gap + 0.05)).round();`n    let grid_error = ((x - margin) - grid_x * (orientation.width + cfg.cut_gap + 0.05)).abs() + ((y - margin) - grid_y * (orientation.height + cfg.cut_gap + 0.05)).abs();`n    let rectangular = parts[part_index].part.contour.len() <= 5 && parts[part_index].part.area / (parts[part_index].part.width * parts[part_index].part.height).max(1.0) > 0.98;`n    let mut score = vec![opening_sheet, two_sided_sheet, if rectangular { scaled(grid_error) } else { 0 }, if rectangular { orientation_index as i64 } else { 0 }];')
-          [IO.File]::WriteAllText($path, $source, [Text.UTF8Encoding]::new($false))
+        run: Expand-Archive engine/rust_source_012.zip engine/build -Force
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Build release engine
-        working-directory: engine/build/rust
+        working-directory: engine/build/work012
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Generate 363-part job and benchmark
         shell: pwsh
-        working-directory: engine/build/rust
+        working-directory: engine/build/work012
         run: |
           $ErrorActionPreference = 'Stop'
-          $definition = Get-Content -Raw '../../../benchmark/model_363_shapes.json' | ConvertFrom-Json
+          $definition = Get-Content -Raw '../../benchmark/model_363_shapes.json' | ConvertFrom-Json
           $parts = @()
           $order = 0
           foreach ($shape in $definition.shapes) {
@@ -87,7 +54,7 @@ jobs:
           $job = @{
             protocol_version = 2
             source = 'nesting.skp-363'
-            optimization_attempts = 48
+            optimization_attempts = 56
             materials = @(@{
               key = 'bt100|17.4'
               material = 'BT100'
@@ -122,6 +89,7 @@ jobs:
           & $exe --job $jobPath --result $resultPath --progress $progressPath --preview $previewPath --svg $svgPath --cancel $cancelPath --workers 4
           if ($LASTEXITCODE -ne 0) { throw "Engine exit $LASTEXITCODE" }
           $result = Get-Content -Raw $resultPath | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Engine result is not ok' }
           $layout = $result.layouts[0]
           Write-Host "MODEL_363 sheets=$($layout.sheets.Count) utilization=$($layout.used_percent) first=$($layout.first_sheet_used_percent) elapsed_ms=$($layout.elapsed_ms) strategy=$($layout.solver_strategy)"
           Copy-Item $resultPath "$env:GITHUB_WORKSPACE/model_363_result.json"
@@ -129,9 +97,9 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mn-model-363-baseline
+          name: mn-model-363-v012
           path: |
             model_363_result.json
             model_363_result.svg
-            engine/build/rust/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
+            engine/build/work012/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
           if-no-files-found: error
