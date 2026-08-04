@@ -27,13 +27,17 @@ jobs:
             if ($text.Length -ne $expected[$_]) {
               throw "$path length $($text.Length), expected $($expected[$_])"
             }
-            Write-Host "$path clean_length=$($text.Length)"
             $text
           }
           $encoded = $chunks -join ''
-          Write-Host "combined_length=$($encoded.Length) modulo=$($encoded.Length % 4)"
           [IO.File]::WriteAllBytes('engine/rust_source_012_adaptive.zip', [Convert]::FromBase64String($encoded))
-          Expand-Archive engine/rust_source_012_adaptive.zip engine/build -Force
+          $hash = (Get-FileHash engine/rust_source_012_adaptive.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "adaptive_zip_sha256=$hash"
+          if ($hash -ne '5d12dbb3bb6c58eee4bfecfcd2035e78111d967ef8a14ce8762b8d316be52cab') {
+            throw "Adaptive source archive hash mismatch: $hash"
+          }
+          New-Item -ItemType Directory -Force engine/build | Out-Null
+          tar.exe -xf engine/rust_source_012_adaptive.zip -C engine/build
 
       - uses: dtolnay/rust-toolchain@stable
         with:
