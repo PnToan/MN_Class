@@ -14,18 +14,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore Rust 0.1.2 source
+      - name: Restore adaptive Rust 0.1.2 source
         shell: pwsh
         run: |
           $encoded = (0..5 | ForEach-Object {
-            Get-Content -Raw ("engine/rust_source_012.part{0:D2}" -f $_)
+            Get-Content -Raw ("engine/rust_source_012_adaptive.part{0:D2}" -f $_)
           }) -join ''
-          [IO.File]::WriteAllBytes('engine/rust_source_012_restored.zip', [Convert]::FromBase64String($encoded.Trim()))
-          Expand-Archive engine/rust_source_012_restored.zip engine/build -Force
-
-      - name: Apply adaptive mixed-family optimizer
-        shell: pwsh
-        run: git apply --whitespace=nowarn --directory=engine/build/work012 -p0 engine/patches/adaptive_family_012.patch
+          [IO.File]::WriteAllBytes('engine/rust_source_012_adaptive.zip', [Convert]::FromBase64String($encoded.Trim()))
+          Expand-Archive engine/rust_source_012_adaptive.zip engine/build -Force
 
       - uses: dtolnay/rust-toolchain@stable
         with:
