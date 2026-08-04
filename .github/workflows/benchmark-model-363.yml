@@ -16,7 +16,9 @@ jobs:
 
       - name: Restore Rust 0.1.2 source
         shell: pwsh
-        run: Expand-Archive engine/rust_source_012.zip engine/build -Force
+        run: |
+          New-Item -ItemType Directory -Force engine/build | Out-Null
+          tar.exe -xf engine/rust_source_012.zip -C engine/build
 
       - uses: dtolnay/rust-toolchain@stable
         with:
