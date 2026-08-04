@@ -45,7 +45,7 @@ jobs:
                 entity_id = "shape-$order"
                 order = $order
                 contour = $shape.contour
-                holes = @()
+                holes = $shape.holes
                 area = [double]$shape.area
                 width = [double]$shape.width
                 height = [double]$shape.height
