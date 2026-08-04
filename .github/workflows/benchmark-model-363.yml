@@ -17,10 +17,16 @@ jobs:
       - name: Restore adaptive Rust 0.1.2 source
         shell: pwsh
         run: |
-          $encoded = (0..5 | ForEach-Object {
-            Get-Content -Raw ("engine/rust_source_012_adaptive.part{0:D2}" -f $_)
-          }) -join ''
-          [IO.File]::WriteAllBytes('engine/rust_source_012_adaptive.zip', [Convert]::FromBase64String($encoded.Trim()))
+          $chunks = 0..5 | ForEach-Object {
+            $path = "engine/rust_source_012_adaptive.part{0:D2}" -f $_
+            $text = Get-Content -Raw $path
+            $invalid = [regex]::Matches($text, '[^A-Za-z0-9+/=\s]')
+            Write-Host "$path length=$($text.Length) invalid=$($invalid.Count)"
+            $text
+          }
+          $encoded = ($chunks -join '') -replace '[^A-Za-z0-9+/=]', ''
+          Write-Host "combined_clean_length=$($encoded.Length) modulo=$($encoded.Length % 4)"
+          [IO.File]::WriteAllBytes('engine/rust_source_012_adaptive.zip', [Convert]::FromBase64String($encoded))
           Expand-Archive engine/rust_source_012_adaptive.zip engine/build -Force
 
       - uses: dtolnay/rust-toolchain@stable
