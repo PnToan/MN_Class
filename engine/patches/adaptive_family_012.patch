@@ -1,0 +1,403 @@
+--- src/engine.rs	2026-08-04 03:02:17.191397120 +0000
++++ src/engine.rs	2026-08-04 03:02:17.611850533 +0000
+@@ -22,6 +22,9 @@
+ const MAX_CANDIDATES_SPECIAL: usize = 18_000;
+ const MAX_EJECTION_RETRIES: usize = 2;
+ const MAX_EJECTION_CANDIDATES: usize = 10;
++const PROBE_CANDIDATES_REGULAR: usize = 650;
++const PROBE_CANDIDATES_SPECIAL: usize = 1_100;
++const ADAPTIVE_VARIANTS: usize = 12;
+ 
+ #[derive(Clone)]
+ struct PreparedPart {
+@@ -252,6 +255,40 @@
+     front_load_parts(&prepared, cfg, &container, &mut best, deadline, runner)?;
+     compact_solution(&prepared, cfg, &container, &mut best, deadline, runner)?;
+ 
++    // A dynamic family selector avoids opening a new sheet merely because the
++    // next item in a fixed list does not fit. It evaluates one representative
++    // of every remaining shape family and keeps filling existing cavities.
++    for adaptive_attempt in 0..ADAPTIVE_VARIANTS {
++        if runner.cancelled() {
++            anyhow::bail!("CANCELLED");
++        }
++        if Instant::now() >= deadline || best.sheets.len() <= lower_bound {
++            break;
++        }
++        let target_cap = best.sheets.len() - 1;
++        if let Some(mut candidate) = construct_solution_adaptive(
++            &prepared,
++            cfg,
++            &container,
++            target_cap,
++            adaptive_attempt,
++            deadline,
++            runner,
++        )? {
++            front_load_parts(
++                &prepared, cfg, &container, &mut candidate, deadline, runner,
++            )?;
++            compact_solution(
++                &prepared, cfg, &container, &mut candidate, deadline, runner,
++            )?;
++            if solution_score(&prepared, cfg, &candidate).tuple()
++                < solution_score(&prepared, cfg, &best).tuple()
++            {
++                best = candidate;
++            }
++        }
++    }
++
+     let base_progress = (material_index as f64 / total_materials.max(1) as f64) * 96.0;
+     let span_progress = 96.0 / total_materials.max(1) as f64;
+ 
+@@ -641,6 +678,189 @@
+     Ok(Some(solution))
+ }
+ 
++
++#[allow(clippy::too_many_arguments)]
++fn construct_solution_adaptive(
++    parts: &[PreparedPart],
++    cfg: &Config,
++    container: &Container,
++    cap: usize,
++    attempt: usize,
++    deadline: Instant,
++    runner: &Runner,
++) -> anyhow::Result<Option<Solution>> {
++    let mut groups: HashMap<(usize, u64), VecDeque<usize>> = HashMap::new();
++    for part_index in 0..parts.len() {
++        let flip_class = usize::from(!(cfg.optimize_flip_face && parts[part_index].part.two_sided));
++        groups
++            .entry((flip_class, parts[part_index].shape_key))
++            .or_default()
++            .push_back(part_index);
++    }
++
++    let mut solution = Solution {
++        sheets: vec![],
++        strategy: format!("mn_adaptive_family_cap_{cap}"),
++        attempt,
++    };
++    let mut remaining = parts.len();
++    let mut step = 0usize;
++
++    while remaining > 0 {
++        if runner.cancelled() {
++            anyhow::bail!("CANCELLED");
++        }
++        if Instant::now() >= deadline {
++            return Ok(None);
++        }
++
++        let active_flip = groups
++            .iter()
++            .filter(|(_, queue)| !queue.is_empty())
++            .map(|(key, _)| key.0)
++            .min()
++            .unwrap_or(1);
++        let mut representatives: Vec<usize> = groups
++            .iter()
++            .filter(|(key, queue)| key.0 == active_flip && !queue.is_empty())
++            .filter_map(|(_, queue)| queue.front().copied())
++            .collect();
++
++        representatives.sort_by(|&left, &right| {
++            adaptive_family_order(parts, left, right, attempt + step)
++        });
++        representatives.dedup();
++
++        let mut best: Option<(Vec<i64>, Solution, usize)> = None;
++        for part_index in representatives.iter().copied() {
++            if Instant::now() >= deadline {
++                return Ok(None);
++            }
++            let mut trial = solution.clone();
++            if !place_part_best_probe(
++                parts,
++                cfg,
++                container,
++                &mut trial,
++                part_index,
++                cap,
++                attempt + step,
++            ) {
++                continue;
++            }
++            let rank = adaptive_trial_rank(parts, cfg, &solution, &trial, part_index);
++            if best
++                .as_ref()
++                .is_none_or(|current| rank.as_slice() < current.0.as_slice())
++            {
++                best = Some((rank, trial, part_index));
++            }
++        }
++
++        // Probe search is deliberately small. Before declaring a hard-cap
++        // failure, retry each active family with the full Jagua candidate set.
++        if best.is_none() {
++            for part_index in representatives.iter().copied() {
++                if Instant::now() >= deadline {
++                    return Ok(None);
++                }
++                let mut trial = solution.clone();
++                if !place_part_best(
++                    parts,
++                    cfg,
++                    container,
++                    &mut trial,
++                    part_index,
++                    cap,
++                    attempt + step,
++                ) {
++                    continue;
++                }
++                let rank = adaptive_trial_rank(parts, cfg, &solution, &trial, part_index);
++                if best
++                    .as_ref()
++                    .is_none_or(|current| rank.as_slice() < current.0.as_slice())
++                {
++                    best = Some((rank, trial, part_index));
++                }
++            }
++        }
++
++        let Some((_, trial, selected)) = best else {
++            return Ok(None);
++        };
++        solution = trial;
++        let flip_class = usize::from(!(cfg.optimize_flip_face && parts[selected].part.two_sided));
++        let key = (flip_class, parts[selected].shape_key);
++        let removed = groups.get_mut(&key).and_then(VecDeque::pop_front);
++        if removed != Some(selected) {
++            return Ok(None);
++        }
++        remaining -= 1;
++        step += 1;
++    }
++
++    Ok(Some(solution))
++}
++
++fn adaptive_family_order(
++    parts: &[PreparedPart],
++    left: usize,
++    right: usize,
++    variant: usize,
++) -> std::cmp::Ordering {
++    let a = &parts[left].part;
++    let b = &parts[right].part;
++    let bbox_a = (a.width * a.height).max(1.0);
++    let bbox_b = (b.width * b.height).max(1.0);
++    let fill_a = a.area.max(0.0) / bbox_a;
++    let fill_b = b.area.max(0.0) / bbox_b;
++    match variant % 5 {
++        0 => b.area.total_cmp(&a.area),
++        1 => bbox_b.total_cmp(&bbox_a),
++        2 => fill_a.total_cmp(&fill_b).then(b.area.total_cmp(&a.area)),
++        3 => a.area.total_cmp(&b.area),
++        _ => (parts[left].shape_key ^ variant as u64)
++            .cmp(&(parts[right].shape_key ^ variant as u64)),
++    }
++    .then(a.order.cmp(&b.order))
++}
++
++fn adaptive_trial_rank(
++    parts: &[PreparedPart],
++    cfg: &Config,
++    before: &Solution,
++    after: &Solution,
++    part_index: usize,
++) -> Vec<i64> {
++    let target_sheet = (0..after.sheets.len())
++        .find(|&index| {
++            after.sheets[index].placements.len()
++                > before.sheets.get(index).map_or(0, |sheet| sheet.placements.len())
++        })
++        .unwrap_or(after.sheets.len().saturating_sub(1));
++    let opened_sheet = i64::from(after.sheets.len() > before.sheets.len());
++    let sheet = &after.sheets[target_sheet];
++    let board_area = (cfg.board_width * cfg.board_height).max(1.0);
++    let utilization = sheet_area(parts, sheet) / board_area * 100.0;
++    let utilization_deficit = (TARGET_UTILIZATION - utilization).max(0.0);
++    let (right, top) = sheet_extent(parts, sheet);
++    let compact_area = (right - cfg.edge_margin).max(0.0)
++        * (top - cfg.edge_margin).max(0.0);
++    let cavity_waste = (compact_area - sheet_area(parts, sheet)).max(0.0);
++    let sheet_score = single_sheet_score(parts, cfg, sheet);
++
++    vec![
++        opened_sheet,
++        target_sheet as i64,
++        scaled(utilization_deficit),
++        scaled(cavity_waste),
++        sheet_score.1,
++        sheet_score.2,
++        scaled(-parts[part_index].part.area.max(0.0)),
++    ]
++}
++
+ fn try_single_ejection(
+     parts: &[PreparedPart],
+     cfg: &Config,
+@@ -724,6 +944,41 @@
+     cap: usize,
+     attempt: usize,
+ ) -> bool {
++    place_part_best_mode(
++        parts, cfg, container, solution, part_index, cap, attempt, None,
++    )
++}
++
++fn place_part_best_probe(
++    parts: &[PreparedPart],
++    cfg: &Config,
++    container: &Container,
++    solution: &mut Solution,
++    part_index: usize,
++    cap: usize,
++    attempt: usize,
++) -> bool {
++    let limit = if parts[part_index].part.special_shape {
++        PROBE_CANDIDATES_SPECIAL
++    } else {
++        PROBE_CANDIDATES_REGULAR
++    };
++    place_part_best_mode(
++        parts, cfg, container, solution, part_index, cap, attempt, Some(limit),
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++fn place_part_best_mode(
++    parts: &[PreparedPart],
++    cfg: &Config,
++    container: &Container,
++    solution: &mut Solution,
++    part_index: usize,
++    cap: usize,
++    attempt: usize,
++    candidate_limit: Option<usize>,
++) -> bool {
+     let can_open = solution.sheets.len() < cap;
+     let search_count = solution.sheets.len() + usize::from(can_open);
+     if search_count == 0 {
+@@ -742,6 +997,7 @@
+             &solution.sheets[sheet_index],
+             part_index,
+             attempt,
++            candidate_limit,
+         );
+         for (orientation_index, x, y) in candidates {
+             if let Some(internal) = feasible_transform(
+@@ -841,6 +1097,7 @@
+     sheet: &Sheet,
+     part_index: usize,
+     attempt: usize,
++    candidate_limit: Option<usize>,
+ ) -> Vec<(usize, f64, f64)> {
+     let mut out = Vec::new();
+     let mut seen = HashSet::new();
+@@ -850,11 +1107,14 @@
+     let margin = cfg.edge_margin + cfg.cut_gap + 0.01;
+     let separation = cfg.cut_gap + 0.05;
+     let special = parts[part_index].part.special_shape;
+-    let orientation_limit = if special {
+-        MAX_CANDIDATES_SPECIAL
+-    } else {
+-        MAX_CANDIDATES_REGULAR
+-    };
++    let orientation_limit = candidate_limit.unwrap_or_else(|| {
++        if special {
++            MAX_CANDIDATES_SPECIAL
++        } else {
++            MAX_CANDIDATES_REGULAR
++        }
++    });
++    let probe = candidate_limit.is_some();
+ 
+     for (orientation_index, orientation) in parts[part_index].orientations.iter().enumerate() {
+         let orientation_start = out.len();
+@@ -937,8 +1197,14 @@
+         y_anchors.sort_by(f64::total_cmp);
+         x_anchors.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+         y_anchors.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+-        let x_limit = if special { 96 } else { 56 };
+-        let y_limit = if special { 96 } else { 56 };
++        let x_limit = if probe {
++            if special { 36 } else { 24 }
++        } else if special {
++            96
++        } else {
++            56
++        };
++        let y_limit = x_limit;
+         for &x in x_anchors.iter().take(x_limit) {
+             for &y in y_anchors.iter().take(y_limit) {
+                 push_candidate(
+@@ -962,15 +1228,36 @@
+             boundary_a.total_cmp(&boundary_b)
+                 .then(parts[pb.part_index].part.special_shape.cmp(&parts[pa.part_index].part.special_shape))
+         });
+-        let fixed_limit = if special { 18 } else { 12 };
++        let fixed_limit = if probe {
++            if special { 10 } else { 7 }
++        } else if special {
++            18
++        } else {
++            12
++        };
+         fixed_indices.truncate(fixed_limit);
+-        let moving_vertices = sample_vertices(&orientation.contour, if special { 16 } else { 10 });
++        let moving_vertices = sample_vertices(
++            &orientation.contour,
++            if probe {
++                if special { 10 } else { 7 }
++            } else if special {
++                16
++            } else {
++                10
++            },
++        );
+         for fixed_index in fixed_indices {
+             let fixed = &sheet.placements[fixed_index];
+             let fixed_orientation = &parts[fixed.part_index].orientations[fixed.orientation_index];
+             let fixed_vertices = sample_vertices(
+                 &fixed_orientation.contour,
+-                if special || parts[fixed.part_index].part.special_shape { 16 } else { 10 },
++                if probe {
++                    if special || parts[fixed.part_index].part.special_shape { 10 } else { 7 }
++                } else if special || parts[fixed.part_index].part.special_shape {
++                    16
++                } else {
++                    10
++                },
+             );
+             for fixed_vertex in &fixed_vertices {
+                 let world_x = fixed.x + fixed_vertex[0];
+@@ -1006,7 +1293,15 @@
+             }
+         }
+ 
+-        let sample_count = if special { 1_200 } else if sheet.placements.len() < 8 { 400 } else { 180 };
++        let sample_count = if probe {
++            if special { 180 } else { 90 }
++        } else if special {
++            1_200
++        } else if sheet.placements.len() < 8 {
++            400
++        } else {
++            180
++        };
+         let seed = attempt
+             .wrapping_mul(1_009)
+             .wrapping_add(part_index.wrapping_mul(97))
+@@ -1360,6 +1655,7 @@
+                         &solution.sheets[to],
+                         moving.part_index,
+                         pass,
++                        None,
+                     );
+                     for (orientation_index, x, y) in candidates {
+                         if let Some(internal) = feasible_transform(
