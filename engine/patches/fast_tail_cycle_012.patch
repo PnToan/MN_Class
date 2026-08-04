@@ -1,0 +1,111 @@
+--- src/engine.rs
++++ src/engine.rs
+@@ -25,8 +25,9 @@
+ const PROBE_CANDIDATES_REGULAR: usize = 650;
+ const PROBE_CANDIDATES_SPECIAL: usize = 1_100;
+ const ADAPTIVE_VARIANTS: usize = 4;
+-const TAIL_PROBE_REGULAR: usize = 240;
+-const TAIL_PROBE_SPECIAL: usize = 420;
++const TAIL_PROBE_REGULAR: usize = 96;
++const TAIL_PROBE_SPECIAL: usize = 180;
++const TAIL_FAMILY_SHORTLIST: usize = 4;
+ 
+ #[derive(Clone)]
+ struct PreparedPart {
+@@ -937,8 +938,17 @@
+                 adaptive_family_order(parts, left, right, variant + step)
+             });
+ 
++            if !representatives.is_empty() {
++                let rotate = (variant.wrapping_mul(17).wrapping_add(step)) % representatives.len();
++                representatives.rotate_left(rotate);
++            }
++
+             let mut selected: Option<(Vec<i64>, Sheet, usize)> = None;
+-            for part_index in representatives.iter().copied() {
++            for part_index in representatives
++                .iter()
++                .copied()
++                .take(TAIL_FAMILY_SHORTLIST)
++            {
+                 let mut trial_solution = Solution {
+                     sheets: vec![current.clone()],
+                     strategy: String::new(),
+@@ -971,17 +981,26 @@
+                 }
+             }
+ 
+-            // The reduced probe must not close a sheet prematurely. When none
+-            // of the families fit, retry every representative with the full
+-            // candidate set before starting the next sheet.
++            // If the shortlist did not fit, scan the other families with the
++            // same cheap probe. Full Jagua candidates are only used when the
++            // entire family cycle appears blocked.
+             if selected.is_none() {
+-                for part_index in representatives.iter().copied() {
++                for part_index in representatives
++                    .iter()
++                    .copied()
++                    .skip(TAIL_FAMILY_SHORTLIST)
++                {
+                     let mut trial_solution = Solution {
+                         sheets: vec![current.clone()],
+                         strategy: String::new(),
+                         attempt: variant,
+                     };
+-                    if !place_part_best(
++                    let probe_limit = if parts[part_index].part.special_shape {
++                        TAIL_PROBE_SPECIAL
++                    } else {
++                        TAIL_PROBE_REGULAR
++                    };
++                    if place_part_best_mode(
+                         parts,
+                         cfg,
+                         container,
+@@ -989,16 +1008,37 @@
+                         part_index,
+                         1,
+                         variant.wrapping_mul(10_007).wrapping_add(step),
++                        Some(probe_limit),
+                     ) {
+-                        continue;
++                        let trial_sheet = trial_solution.sheets.remove(0);
++                        selected = Some((Vec::new(), trial_sheet, part_index));
++                        break;
+                     }
+-                    let trial_sheet = trial_solution.sheets.remove(0);
+-                    let rank = tail_trial_rank(parts, cfg, &current, &trial_sheet, part_index, variant);
+-                    if selected
+-                        .as_ref()
+-                        .is_none_or(|current_best| rank.as_slice() < current_best.0.as_slice())
+-                    {
+-                        selected = Some((rank, trial_sheet, part_index));
++                }
++            }
++
++            // The reduced probe must not close a sheet prematurely. Retry each
++            // remaining family with the full candidate set before opening a
++            // new sheet.
++            if selected.is_none() {
++                for part_index in representatives.iter().copied() {
++                    let mut trial_solution = Solution {
++                        sheets: vec![current.clone()],
++                        strategy: String::new(),
++                        attempt: variant,
++                    };
++                    if place_part_best(
++                        parts,
++                        cfg,
++                        container,
++                        &mut trial_solution,
++                        part_index,
++                        1,
++                        variant.wrapping_mul(10_007).wrapping_add(step),
++                    ) {
++                        let trial_sheet = trial_solution.sheets.remove(0);
++                        selected = Some((Vec::new(), trial_sheet, part_index));
++                        break;
+                     }
+                 }
+             }
