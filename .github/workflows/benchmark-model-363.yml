@@ -17,6 +17,15 @@ jobs:
       - name: Restore adaptive Rust 0.1.2 source
         shell: pwsh
         run: |
+          function Get-TextHash([string]$value) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+              $bytes = [Text.UTF8Encoding]::new($false).GetBytes($value)
+              return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
+            }
+          }
           $expectedLength = @(4900,4900,4900,4900,4900,3432)
           $expectedHash = @(
             'c7d26c3c35a29e515aeeddd28a19ba766bcc3d3ed7d9dc0febc936e46c8d8254',
@@ -27,21 +36,29 @@ jobs:
             '4c79c67d546107d88cf0164dfe0b98e05e78b2f18b24ffd5e886cb6c27c8f669'
           )
           $chunks = 0..5 | ForEach-Object {
-            $path = "engine/rust_source_012_adaptive.part{0:D2}" -f $_
+            $partIndex = $_
+            $path = "engine/rust_source_012_adaptive.part{0:D2}" -f $partIndex
             $text = (Get-Content -Raw $path) -replace '[^A-Za-z0-9+/=]', ''
-            if ($text.Length -gt $expectedLength[$_]) {
-              $text = $text.Substring(0, $expectedLength[$_])
+            $targetLength = $expectedLength[$partIndex]
+            $targetHash = $expectedHash[$partIndex]
+            if ($text.Length -eq ($targetLength + 1)) {
+              $fixed = $null
+              for ($charIndex = 0; $charIndex -lt $text.Length; $charIndex++) {
+                $candidate = $text.Remove($charIndex, 1)
+                if ((Get-TextHash $candidate) -eq $targetHash) {
+                  Write-Host "$path removed_extra_index=$charIndex char=$($text[$charIndex])"
+                  $fixed = $candidate
+                  break
+                }
+              }
+              if ($null -eq $fixed) { throw "$path extra character could not be corrected" }
+              $text = $fixed
             }
-            if ($text.Length -ne $expectedLength[$_]) {
-              throw "$path length $($text.Length), expected $($expectedLength[$_])"
+            if ($text.Length -ne $targetLength) {
+              throw "$path length $($text.Length), expected $targetLength"
             }
-            $tmp = Join-Path $env:RUNNER_TEMP ("part{0:D2}.txt" -f $_)
-            [IO.File]::WriteAllText($tmp, $text, [Text.UTF8Encoding]::new($false))
-            $hash = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
-            Write-Host "$path hash=$hash expected=$($expectedHash[$_])"
-            if ($hash -ne $expectedHash[$_]) {
-              throw "$path hash mismatch"
-            }
+            $hash = Get-TextHash $text
+            if ($hash -ne $targetHash) { throw "$path hash mismatch: $hash" }
             $text
           }
           $encoded = $chunks -join ''
