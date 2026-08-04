@@ -28,10 +28,11 @@ jobs:
           tar.exe -xf engine/rust_source_012_adaptive.zip -C engine/build
 
       - name: Apply tail repack patches
-        shell: pwsh
+        shell: bash
         run: |
-          git apply --whitespace=nowarn --directory=engine/build/work012 -p0 engine/patches/tail_repack_012.patch
-          git apply --whitespace=nowarn --directory=engine/build/work012 -p0 engine/patches/tail_timeout_guard.patch
+          cd engine/build/work012
+          patch -p0 --forward < ../../patches/tail_repack_012.patch
+          patch -p0 --forward < ../../patches/tail_timeout_guard.patch
 
       - uses: dtolnay/rust-toolchain@stable
         with:
