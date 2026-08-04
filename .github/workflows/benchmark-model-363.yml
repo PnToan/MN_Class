@@ -23,6 +23,11 @@ jobs:
           [IO.File]::WriteAllBytes('engine/rust_source_012_restored.zip', [Convert]::FromBase64String($encoded.Trim()))
           Expand-Archive engine/rust_source_012_restored.zip engine/build -Force
 
+      - name: Apply adaptive mixed-family optimizer
+        shell: pwsh
+        working-directory: engine/build/work012
+        run: git apply --whitespace=nowarn ../../patches/adaptive_family_012.patch
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -102,7 +107,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mn-model-363-v012
+          name: mn-model-363-v012-adaptive
           path: |
             model_363_result.json
             model_363_result.svg
