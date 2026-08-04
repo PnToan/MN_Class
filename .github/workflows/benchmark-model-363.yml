@@ -17,22 +17,36 @@ jobs:
       - name: Restore adaptive Rust 0.1.2 source
         shell: pwsh
         run: |
-          $expected = @(4900,4900,4900,4900,4900,3432)
+          $expectedLength = @(4900,4900,4900,4900,4900,3432)
+          $expectedHash = @(
+            'c7d26c3c35a29e515aeeddd28a19ba766bcc3d3ed7d9dc0febc936e46c8d8254',
+            '7b468e99138a19ac0b73e7791c6dce6612cf05703851f0083f8863668a49db9a',
+            'e04403aa41159ed49bfdcf06ab5403c5b2cc9cbabc6c71b1ad15394a40a15b23',
+            'd6a49dd4788aed92cd427a42b89d07aab55d010c984f242da2abeb9c62cb8230',
+            '5803153dbfde056a2697a999f798493dc54d7292c12b49045f9351c6e0e51527',
+            '4c79c67d546107d88cf0164dfe0b98e05e78b2f18b24ffd5e886cb6c27c8f669'
+          )
           $chunks = 0..5 | ForEach-Object {
             $path = "engine/rust_source_012_adaptive.part{0:D2}" -f $_
             $text = (Get-Content -Raw $path) -replace '[^A-Za-z0-9+/=]', ''
-            if ($text.Length -gt $expected[$_]) {
-              $text = $text.Substring(0, $expected[$_])
+            if ($text.Length -gt $expectedLength[$_]) {
+              $text = $text.Substring(0, $expectedLength[$_])
             }
-            if ($text.Length -ne $expected[$_]) {
-              throw "$path length $($text.Length), expected $($expected[$_])"
+            if ($text.Length -ne $expectedLength[$_]) {
+              throw "$path length $($text.Length), expected $($expectedLength[$_])"
+            }
+            $tmp = Join-Path $env:RUNNER_TEMP ("part{0:D2}.txt" -f $_)
+            [IO.File]::WriteAllText($tmp, $text, [Text.UTF8Encoding]::new($false))
+            $hash = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "$path hash=$hash expected=$($expectedHash[$_])"
+            if ($hash -ne $expectedHash[$_]) {
+              throw "$path hash mismatch"
             }
             $text
           }
           $encoded = $chunks -join ''
           [IO.File]::WriteAllBytes('engine/rust_source_012_adaptive.zip', [Convert]::FromBase64String($encoded))
           $hash = (Get-FileHash engine/rust_source_012_adaptive.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          Write-Host "adaptive_zip_sha256=$hash"
           if ($hash -ne '5d12dbb3bb6c58eee4bfecfcd2035e78111d967ef8a14ce8762b8d316be52cab') {
             throw "Adaptive source archive hash mismatch: $hash"
           }
