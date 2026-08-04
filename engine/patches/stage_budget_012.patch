@@ -1,0 +1,43 @@
+--- src/engine.rs
++++ src/engine.rs
+@@ -245,17 +245,37 @@
+     )?
+     .context("Không tạo được phương án nesting nền")?;
+ 
++    // Reserve most of the runtime for the mixed-family tail rebuild. The old
++    // reduction pass could consume the complete deadline without changing the
++    // sheet count, leaving no time for the stronger global repair stage.
++    let baseline_stage_ms = if prepared.len() >= 250 {
++        60_000
++    } else if prepared.len() >= 120 {
++        45_000
++    } else {
++        25_000
++    };
++    let staged_deadline = Instant::now() + Duration::from_millis(baseline_stage_ms);
++    let baseline_deadline = if staged_deadline < deadline {
++        staged_deadline
++    } else {
++        deadline
++    };
+     reduce_sheet_count(
+         &prepared,
+         cfg,
+         &container,
+         &mut best,
+         lower_bound,
+-        deadline,
++        baseline_deadline,
+         runner,
+     )?;
+-    front_load_parts(&prepared, cfg, &container, &mut best, deadline, runner)?;
+-    compact_solution(&prepared, cfg, &container, &mut best, deadline, runner)?;
++    front_load_parts(
++        &prepared, cfg, &container, &mut best, baseline_deadline, runner,
++    )?;
++    compact_solution(
++        &prepared, cfg, &container, &mut best, baseline_deadline, runner,
++    )?;
+ 
+     // Rebuild the fragmented tail sheet-by-sheet. The first dense sheets are
+     // preserved, while all remaining shape families compete for every cavity
