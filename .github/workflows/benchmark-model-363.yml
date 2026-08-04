@@ -17,8 +17,11 @@ jobs:
       - name: Restore Rust 0.1.2 source
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force engine/build | Out-Null
-          tar.exe -xf engine/rust_source_012.zip -C engine/build
+          $encoded = (0..5 | ForEach-Object {
+            Get-Content -Raw ("engine/rust_source_012.part{0:D2}" -f $_)
+          }) -join ''
+          [IO.File]::WriteAllBytes('engine/rust_source_012_restored.zip', [Convert]::FromBase64String($encoded.Trim()))
+          Expand-Archive engine/rust_source_012_restored.zip engine/build -Force
 
       - uses: dtolnay/rust-toolchain@stable
         with:
