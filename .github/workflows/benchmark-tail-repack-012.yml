@@ -1,0 +1,78 @@
+name: Benchmark tail repack 0.1.2
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  benchmark-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore adaptive source
+        shell: pwsh
+        run: |
+          $parts = 0..5 | ForEach-Object {
+            $text = (Get-Content -Raw ("engine/rust_source_012_adaptive.part{0:D2}" -f $_)) -replace '[^A-Za-z0-9+/=]', ''
+            if ($_ -eq 0 -and $text.Length -eq 4901) { $text = $text.Remove(4084, 1) }
+            $text
+          }
+          $encoded = $parts -join ''
+          [IO.File]::WriteAllBytes('engine/rust_source_012_adaptive.zip', [Convert]::FromBase64String($encoded))
+          New-Item -ItemType Directory -Force engine/build | Out-Null
+          tar.exe -xf engine/rust_source_012_adaptive.zip -C engine/build
+
+      - name: Apply tail repack patches
+        shell: bash
+        run: |
+          cd engine/build/work012
+          patch -p0 --forward < ../../patches/tail_repack_012.patch
+          patch -p0 --forward < ../../patches/tail_timeout_guard.patch
+          patch -p0 --forward < ../../patches/stage_budget_012.patch
+          patch -p0 --forward < ../../patches/fast_tail_cycle_012.patch
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release engine
+        working-directory: engine/build/work012
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Generate benchmark job
+        run: python engine/benchmark/generate_model_363_job.py
+
+      - name: Run real 363-part benchmark
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'mn_tail_repack'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $exe = Resolve-Path 'engine/build/work012/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe'
+          $job = Resolve-Path 'engine/benchmark/nesting_363_job.generated.json'
+          $result = Join-Path $dir 'result.json'
+          $progress = Join-Path $dir 'progress.json'
+          $preview = Join-Path $dir 'preview.json'
+          $svg = Join-Path $dir 'result.svg'
+          $cancel = Join-Path $dir 'cancel.flag'
+          & $exe --job $job --result $result --progress $progress --preview $preview --svg $svg --cancel $cancel --workers 4
+          if ($LASTEXITCODE -ne 0) { throw "Engine exit $LASTEXITCODE" }
+          $data = Get-Content -Raw $result | ConvertFrom-Json
+          if (-not $data.ok) { throw 'Engine result is not ok' }
+          $layout = $data.layouts[0]
+          Write-Host "TAIL_REPACK sheets=$($layout.sheets.Count) utilization=$($layout.used_percent) first=$($layout.first_sheet_used_percent) elapsed_ms=$($layout.elapsed_ms) strategy=$($layout.solver_strategy)"
+          Copy-Item $result "$env:GITHUB_WORKSPACE/tail_repack_result.json"
+          Copy-Item $svg "$env:GITHUB_WORKSPACE/tail_repack_result.svg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mn-tail-repack-012
+          path: |
+            tail_repack_result.json
+            tail_repack_result.svg
+            engine/build/work012/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
+          if-no-files-found: error

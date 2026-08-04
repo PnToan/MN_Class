@@ -1,0 +1,363 @@
+--- src/engine.rs
++++ src/engine.rs
+@@ -24,7 +24,9 @@
+ const MAX_EJECTION_CANDIDATES: usize = 10;
+ const PROBE_CANDIDATES_REGULAR: usize = 650;
+ const PROBE_CANDIDATES_SPECIAL: usize = 1_100;
+-const ADAPTIVE_VARIANTS: usize = 12;
++const ADAPTIVE_VARIANTS: usize = 4;
++const TAIL_PROBE_REGULAR: usize = 240;
++const TAIL_PROBE_SPECIAL: usize = 420;
+ 
+ #[derive(Clone)]
+ struct PreparedPart {
+@@ -255,39 +257,18 @@
+     front_load_parts(&prepared, cfg, &container, &mut best, deadline, runner)?;
+     compact_solution(&prepared, cfg, &container, &mut best, deadline, runner)?;
+ 
+-    // A dynamic family selector avoids opening a new sheet merely because the
+-    // next item in a fixed list does not fit. It evaluates one representative
+-    // of every remaining shape family and keeps filling existing cavities.
+-    for adaptive_attempt in 0..ADAPTIVE_VARIANTS {
+-        if runner.cancelled() {
+-            anyhow::bail!("CANCELLED");
+-        }
+-        if Instant::now() >= deadline || best.sheets.len() <= lower_bound {
+-            break;
+-        }
+-        let target_cap = best.sheets.len() - 1;
+-        if let Some(mut candidate) = construct_solution_adaptive(
+-            &prepared,
+-            cfg,
+-            &container,
+-            target_cap,
+-            adaptive_attempt,
+-            deadline,
+-            runner,
+-        )? {
+-            front_load_parts(
+-                &prepared, cfg, &container, &mut candidate, deadline, runner,
+-            )?;
+-            compact_solution(
+-                &prepared, cfg, &container, &mut candidate, deadline, runner,
+-            )?;
+-            if solution_score(&prepared, cfg, &candidate).tuple()
+-                < solution_score(&prepared, cfg, &best).tuple()
+-            {
+-                best = candidate;
+-            }
+-        }
+-    }
++    // Rebuild the fragmented tail sheet-by-sheet. The first dense sheets are
++    // preserved, while all remaining shape families compete for every cavity
++    // before a new sheet may be opened.
++    repack_fragmented_tail(
++        &prepared,
++        cfg,
++        &container,
++        &mut best,
++        lower_bound,
++        deadline,
++        runner,
++    )?;
+ 
+     let base_progress = (material_index as f64 / total_materials.max(1) as f64) * 96.0;
+     let span_progress = 96.0 / total_materials.max(1) as f64;
+@@ -803,6 +784,297 @@
+     Ok(Some(solution))
+ }
+ 
++
++fn repack_fragmented_tail(
++    parts: &[PreparedPart],
++    cfg: &Config,
++    container: &Container,
++    best: &mut Solution,
++    lower_bound: usize,
++    deadline: Instant,
++    runner: &Runner,
++) -> anyhow::Result<()> {
++    if best.sheets.len() <= lower_bound || Instant::now() >= deadline {
++        return Ok(());
++    }
++
++    let original = best.clone();
++    let mut cut_candidates = Vec::new();
++    let dense_prefix = original
++        .sheets
++        .iter()
++        .take_while(|sheet| sheet_utilization(parts, cfg, sheet) >= 75.0)
++        .count();
++    if dense_prefix > 0 && dense_prefix < original.sheets.len() {
++        cut_candidates.push(dense_prefix);
++    }
++    if original.sheets.len() > 6 {
++        cut_candidates.push(3.min(original.sheets.len() - 1));
++    }
++    cut_candidates.push(0);
++    cut_candidates.sort_unstable();
++    cut_candidates.dedup();
++    cut_candidates.sort_unstable_by(|a, b| b.cmp(a));
++
++    for cut in cut_candidates {
++        if Instant::now() >= deadline || best.sheets.len() <= lower_bound {
++            break;
++        }
++        let remaining: Vec<usize> = original.sheets[cut..]
++            .iter()
++            .flat_map(|sheet| sheet.placements.iter().map(|placed| placed.part_index))
++            .collect();
++        if remaining.is_empty() {
++            continue;
++        }
++
++        for variant in 0..ADAPTIVE_VARIANTS {
++            if runner.cancelled() {
++                anyhow::bail!("CANCELLED");
++            }
++            if Instant::now() >= deadline || best.sheets.len() <= lower_bound {
++                break;
++            }
++            let fixed = original.sheets[..cut].to_vec();
++            let mut candidate = pack_subset_sheet_by_sheet(
++                parts,
++                cfg,
++                container,
++                fixed,
++                &remaining,
++                variant,
++                deadline,
++                runner,
++            )?;
++            candidate.strategy = format!("mn_tail_family_cut_{cut}_variant_{variant}");
++            candidate.attempt = variant;
++
++            if solution_score(parts, cfg, &candidate).tuple()
++                < solution_score(parts, cfg, best).tuple()
++            {
++                *best = candidate;
++            }
++        }
++    }
++    Ok(())
++}
++
++#[allow(clippy::too_many_arguments)]
++fn pack_subset_sheet_by_sheet(
++    parts: &[PreparedPart],
++    cfg: &Config,
++    container: &Container,
++    fixed_sheets: Vec<Sheet>,
++    subset: &[usize],
++    variant: usize,
++    deadline: Instant,
++    runner: &Runner,
++) -> anyhow::Result<Solution> {
++    let mut groups: HashMap<(usize, u64), VecDeque<usize>> = HashMap::new();
++    for &part_index in subset {
++        let flip_class = usize::from(!(cfg.optimize_flip_face && parts[part_index].part.two_sided));
++        groups
++            .entry((flip_class, parts[part_index].shape_key))
++            .or_default()
++            .push_back(part_index);
++    }
++
++    let mut tail_sheets: Vec<Sheet> = Vec::new();
++    let mut remaining = subset.len();
++    let mut step = 0usize;
++
++    while remaining > 0 {
++        if runner.cancelled() {
++            anyhow::bail!("CANCELLED");
++        }
++        if Instant::now() >= deadline {
++            anyhow::bail!("TIMEOUT_TAIL_REPACK");
++        }
++
++        let mut current = empty_sheet(container);
++        let mut placed_on_sheet = 0usize;
++
++        loop {
++            if Instant::now() >= deadline {
++                anyhow::bail!("TIMEOUT_TAIL_REPACK");
++            }
++            let active_flip = groups
++                .iter()
++                .filter(|(_, queue)| !queue.is_empty())
++                .map(|(key, _)| key.0)
++                .min();
++            let Some(active_flip) = active_flip else { break };
++            let mut representatives: Vec<usize> = groups
++                .iter()
++                .filter(|(key, queue)| key.0 == active_flip && !queue.is_empty())
++                .filter_map(|(_, queue)| queue.front().copied())
++                .collect();
++            representatives.sort_by(|&left, &right| {
++                adaptive_family_order(parts, left, right, variant + step)
++            });
++
++            let mut selected: Option<(Vec<i64>, Sheet, usize)> = None;
++            for part_index in representatives.iter().copied() {
++                let mut trial_solution = Solution {
++                    sheets: vec![current.clone()],
++                    strategy: String::new(),
++                    attempt: variant,
++                };
++                let probe_limit = if parts[part_index].part.special_shape {
++                    TAIL_PROBE_SPECIAL
++                } else {
++                    TAIL_PROBE_REGULAR
++                };
++                if !place_part_best_mode(
++                    parts,
++                    cfg,
++                    container,
++                    &mut trial_solution,
++                    part_index,
++                    1,
++                    variant.wrapping_mul(10_007).wrapping_add(step),
++                    Some(probe_limit),
++                ) {
++                    continue;
++                }
++                let trial_sheet = trial_solution.sheets.remove(0);
++                let rank = tail_trial_rank(parts, cfg, &current, &trial_sheet, part_index, variant);
++                if selected
++                    .as_ref()
++                    .is_none_or(|current_best| rank.as_slice() < current_best.0.as_slice())
++                {
++                    selected = Some((rank, trial_sheet, part_index));
++                }
++            }
++
++            // The reduced probe must not close a sheet prematurely. When none
++            // of the families fit, retry every representative with the full
++            // candidate set before starting the next sheet.
++            if selected.is_none() {
++                for part_index in representatives.iter().copied() {
++                    let mut trial_solution = Solution {
++                        sheets: vec![current.clone()],
++                        strategy: String::new(),
++                        attempt: variant,
++                    };
++                    if !place_part_best(
++                        parts,
++                        cfg,
++                        container,
++                        &mut trial_solution,
++                        part_index,
++                        1,
++                        variant.wrapping_mul(10_007).wrapping_add(step),
++                    ) {
++                        continue;
++                    }
++                    let trial_sheet = trial_solution.sheets.remove(0);
++                    let rank = tail_trial_rank(parts, cfg, &current, &trial_sheet, part_index, variant);
++                    if selected
++                        .as_ref()
++                        .is_none_or(|current_best| rank.as_slice() < current_best.0.as_slice())
++                    {
++                        selected = Some((rank, trial_sheet, part_index));
++                    }
++                }
++            }
++
++            let Some((_, trial_sheet, part_index)) = selected else { break };
++            current = trial_sheet;
++            let flip_class = usize::from(!(cfg.optimize_flip_face && parts[part_index].part.two_sided));
++            let key = (flip_class, parts[part_index].shape_key);
++            let removed = groups.get_mut(&key).and_then(VecDeque::pop_front);
++            if removed != Some(part_index) {
++                anyhow::bail!("Sai trạng thái nhóm chi tiết khi repack tail");
++            }
++            remaining -= 1;
++            placed_on_sheet += 1;
++            step += 1;
++        }
++
++        if placed_on_sheet == 0 {
++            anyhow::bail!("Không thể đặt chi tiết còn lại vào tấm mới");
++        }
++        tail_sheets.push(current);
++    }
++
++    let mut sheets = fixed_sheets;
++    sheets.extend(tail_sheets);
++    Ok(Solution {
++        sheets,
++        strategy: String::new(),
++        attempt: variant,
++    })
++}
++
++fn tail_trial_rank(
++    parts: &[PreparedPart],
++    cfg: &Config,
++    before: &Sheet,
++    after: &Sheet,
++    part_index: usize,
++    variant: usize,
++) -> Vec<i64> {
++    let board_area = (cfg.board_width * cfg.board_height).max(1.0);
++    let before_area = sheet_area(parts, before);
++    let after_area = sheet_area(parts, after);
++    let utilization = after_area / board_area * 100.0;
++    let utilization_deficit = (TARGET_UTILIZATION - utilization).max(0.0);
++    let (before_right, before_top) = sheet_extent(parts, before);
++    let (after_right, after_top) = sheet_extent(parts, after);
++    let before_compact = (before_right - cfg.edge_margin).max(0.0)
++        * (before_top - cfg.edge_margin).max(0.0);
++    let after_compact = (after_right - cfg.edge_margin).max(0.0)
++        * (after_top - cfg.edge_margin).max(0.0);
++    let compact_growth = (after_compact - before_compact).max(0.0);
++    let cavity_waste = (after_compact - after_area).max(0.0);
++    let area_gain = (after_area - before_area).max(0.0);
++    let sheet_score = single_sheet_score(parts, cfg, after);
++    let part = &parts[part_index].part;
++    let bbox = (part.width * part.height).max(1.0);
++    let fill_ratio = part.area.max(0.0) / bbox;
++
++    match variant % 4 {
++        // Large anchors first, then compact placement.
++        0 => vec![
++            scaled(utilization_deficit),
++            scaled(compact_growth),
++            scaled(cavity_waste),
++            sheet_score.1,
++            scaled(-area_gain),
++        ],
++        // Minimize compact growth to preserve rectangular free zones.
++        1 => vec![
++            scaled(compact_growth / area_gain.max(1.0)),
++            scaled(cavity_waste),
++            scaled(utilization_deficit),
++            sheet_score.1,
++            scaled(-area_gain),
++        ],
++        // Place low-fill concave shapes early so small families can fill them.
++        2 => vec![
++            scaled(fill_ratio),
++            scaled(compact_growth),
++            scaled(utilization_deficit),
++            sheet_score.1,
++            scaled(-area_gain),
++        ],
++        // Sliver-aware balanced variant.
++        _ => vec![
++            sheet_score.1,
++            sheet_score.2,
++            scaled(compact_growth),
++            scaled(utilization_deficit),
++            scaled(-area_gain),
++        ],
++    }
++}
++
++fn sheet_utilization(parts: &[PreparedPart], cfg: &Config, sheet: &Sheet) -> f64 {
++    let board_area = (cfg.board_width * cfg.board_height).max(1.0);
++    sheet_area(parts, sheet) / board_area * 100.0
++}
++
+ fn adaptive_family_order(
+     parts: &[PreparedPart],
+     left: usize,

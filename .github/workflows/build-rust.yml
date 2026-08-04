@@ -1,23 +1,158 @@
 name: Build Rust Engine
+
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
+
+      - name: Decode optimized source
+        shell: pwsh
+        run: |
+          $encoded = (1..6 | ForEach-Object {
+            Get-Content -Raw ("engine/rust_source_optimized_001.part{0:D2}" -f $_)
+          }) -join ''
+          [System.IO.File]::WriteAllBytes('engine/rust_source.zip', [Convert]::FromBase64String($encoded.Trim()))
+
       - name: Extract source
         shell: pwsh
-        run: Expand-Archive engine/rust_source.zip engine/build
+        run: Expand-Archive engine/rust_source.zip engine/build -Force
+
+      - name: Add deterministic dense-grid candidates
+        shell: pwsh
+        run: |
+          $path = 'engine/build/rust/src/engine.rs'
+          $source = Get-Content -Raw $path
+          $needle = @'
+                  let mut x_anchors = vec![margin, max_x];
+          '@.Trim()
+          $replacement = @'
+                  // Dense deterministic shelf/grid candidates are evaluated before
+                  // contact-heavy candidates so regular parts cannot miss a feasible
+                  // high-utilization row/column pattern when the generic budget fills.
+                  let pitch_x = orientation.width + separation;
+                  let pitch_y = orientation.height + separation;
+                  if pitch_x > 0.0 && pitch_y > 0.0 {
+                      let columns = (((max_x - margin) / pitch_x).floor() as usize).saturating_add(1);
+                      let rows = (((max_y - margin) / pitch_y).floor() as usize).saturating_add(1);
+                      for row in 0..rows {
+                          for column in 0..columns {
+                              push_candidate(
+                                  &mut out,
+                                  &mut seen,
+                                  orientation_index,
+                                  margin + column as f64 * pitch_x,
+                                  margin + row as f64 * pitch_y,
+                                  margin,
+                                  max_x,
+                                  max_y,
+                                  orientation_limit,
+                                  orientation_start,
+                              );
+                          }
+                      }
+                  }
+
+                  let mut x_anchors = vec![margin, max_x];
+          '@.Trim()
+          if (-not $source.Contains($needle)) { throw 'Candidate insertion point not found' }
+          $source = $source.Replace($needle, $replacement)
+          [System.IO.File]::WriteAllText($path, $source, [System.Text.UTF8Encoding]::new($false))
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+
       - name: Build
         working-directory: engine/build/rust
         run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Smoke test engine protocol and 80 percent target
+        shell: pwsh
+        working-directory: engine/build/rust
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testDir = Join-Path $env:RUNNER_TEMP 'mn_nesting_smoke'
+          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+          $jobPath = Join-Path $testDir 'job.json'
+          $resultPath = Join-Path $testDir 'result.json'
+          $progressPath = Join-Path $testDir 'progress.json'
+          $previewPath = Join-Path $testDir 'preview.json'
+          $svgPath = Join-Path $testDir 'result.svg'
+          $cancelPath = Join-Path $testDir 'cancel.flag'
+
+          $parts = @()
+          for ($i = 0; $i -lt 24; $i++) {
+            $parts += @{
+              entity_id = "part-$i"
+              order = $i
+              contour = @(@(0,0), @(150,0), @(150,112), @(0,112))
+              holes = @()
+              area = 16800.0
+              width = 150.0
+              height = 112.0
+              base_rotation_degrees = 0.0
+              two_sided = ($i -lt 4)
+              special_shape = $false
+            }
+          }
+          $jobObject = @{
+            protocol_version = 2
+            source = 'github-actions-utilization-smoke'
+            optimization_attempts = 8
+            materials = @(@{
+              key = 'MDF18'
+              material = 'MDF 18'
+              thickness = 18.0
+              group_index = 0
+              original_part_count = 24
+              configuration = @{
+                board_width = 1000.0
+                board_height = 500.0
+                edge_margin = 10.0
+                cut_gap = 5.0
+                rotation_divisions = 4
+                sheet_in_sheet = $false
+                priority_zone_nesting = $true
+                optimize_flip_face = $true
+                compact_directions = @('left','bottom')
+                max_nesting_time_ms = 60000
+              }
+              parts = $parts
+            })
+          }
+          $jobObject | ConvertTo-Json -Depth 12 -Compress | Set-Content -Encoding utf8NoBOM $jobPath
+
+          $exe = Resolve-Path 'target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe'
+          & $exe --job $jobPath --result $resultPath --progress $progressPath --preview $previewPath --svg $svgPath --cancel $cancelPath --workers 2
+          if ($LASTEXITCODE -ne 0) { throw "Engine exited with code $LASTEXITCODE" }
+          foreach ($path in @($resultPath, $progressPath, $previewPath, $svgPath)) {
+            if (-not (Test-Path $path)) { throw "Missing smoke-test output: $path" }
+          }
+          $result = Get-Content -Raw $resultPath | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Engine result is not ok' }
+          if ($result.engine_version -ne '0.1.1') { throw 'Unexpected engine version' }
+          if ($result.layouts.Count -ne 1) { throw 'Expected one material layout' }
+          if ($result.layouts[0].sheets.Count -ne 1) { throw "Expected one sheet, got $($result.layouts[0].sheets.Count)" }
+          if ($result.layouts[0].sheets[0].placements.Count -ne 24) { throw 'Expected 24 placements' }
+          if ($result.layouts[0].used_percent -lt 80.0) { throw "Expected utilization >= 80%, got $($result.layouts[0].used_percent)" }
+          for ($i = 0; $i -lt 4; $i++) {
+            if ($result.layouts[0].sheets[0].placements[$i].two_sided -ne $true) { throw 'Two-sided parts were not prioritized' }
+          }
+          $progress = Get-Content -Raw $progressPath | ConvertFrom-Json
+          if ($progress.running -ne $false -or $progress.overall_percent -ne 100) { throw 'Progress did not complete cleanly' }
+
       - uses: actions/upload-artifact@v4
         with:
-          name: mn_nesting_engine_windows_x64
+          name: mn_nesting_engine_windows_x64_optimized_002
           path: engine/build/rust/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
+          if-no-files-found: error

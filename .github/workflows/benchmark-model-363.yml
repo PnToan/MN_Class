@@ -1,0 +1,157 @@
+name: Benchmark MN nesting model 363
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  benchmark-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore adaptive Rust 0.1.2 source
+        shell: pwsh
+        run: |
+          function Get-TextHash([string]$value) {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+              $bytes = [Text.UTF8Encoding]::new($false).GetBytes($value)
+              return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
+            }
+          }
+          $expectedLength = @(4900,4900,4900,4900,4900,3432)
+          $expectedHash = @(
+            'c7d26c3c35a29e515aeeddd28a19ba766bcc3d3ed7d9dc0febc936e46c8d8254',
+            '7b468e99138a19ac0b73e7791c6dce6612cf05703851f0083f8863668a49db9a',
+            'e04403aa41159ed49bfdcf06ab5403c5b2cc9cbabc6c71b1ad15394a40a15b23',
+            'd6a49dd4788aed92cd427a42b89d07aab55d010c984f242da2abeb9c62cb8230',
+            '5803153dbfde056a2697a999f798493dc54d7292c12b49045f9351c6e0e51527',
+            '4c79c67d546107d88cf0164dfe0b98e05e78b2f18b24ffd5e886cb6c27c8f669'
+          )
+          $chunks = 0..5 | ForEach-Object {
+            $partIndex = $_
+            $path = "engine/rust_source_012_adaptive.part{0:D2}" -f $partIndex
+            $text = (Get-Content -Raw $path) -replace '[^A-Za-z0-9+/=]', ''
+            $targetLength = $expectedLength[$partIndex]
+            $targetHash = $expectedHash[$partIndex]
+            if ($text.Length -eq ($targetLength + 1)) {
+              $fixed = $null
+              for ($charIndex = 0; $charIndex -lt $text.Length; $charIndex++) {
+                $candidate = $text.Remove($charIndex, 1)
+                if ((Get-TextHash $candidate) -eq $targetHash) {
+                  Write-Host "$path removed_extra_index=$charIndex char=$($text[$charIndex])"
+                  $fixed = $candidate
+                  break
+                }
+              }
+              if ($null -eq $fixed) { throw "$path extra character could not be corrected" }
+              $text = $fixed
+            }
+            if ($text.Length -ne $targetLength) {
+              throw "$path length $($text.Length), expected $targetLength"
+            }
+            $hash = Get-TextHash $text
+            if ($hash -ne $targetHash) { throw "$path hash mismatch: $hash" }
+            $text
+          }
+          $encoded = $chunks -join ''
+          [IO.File]::WriteAllBytes('engine/rust_source_012_adaptive.zip', [Convert]::FromBase64String($encoded))
+          $hash = (Get-FileHash engine/rust_source_012_adaptive.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '5d12dbb3bb6c58eee4bfecfcd2035e78111d967ef8a14ce8762b8d316be52cab') {
+            throw "Adaptive source archive hash mismatch: $hash"
+          }
+          New-Item -ItemType Directory -Force engine/build | Out-Null
+          tar.exe -xf engine/rust_source_012_adaptive.zip -C engine/build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release engine
+        working-directory: engine/build/work012
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Generate 363-part job and benchmark
+        shell: pwsh
+        working-directory: engine/build/work012
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $definition = Get-Content -Raw '../../benchmark/model_363_shapes.json' | ConvertFrom-Json
+          $parts = @()
+          $order = 0
+          foreach ($shape in $definition.shapes) {
+            for ($copy = 0; $copy -lt [int]$shape.count; $copy++) {
+              $parts += @{
+                entity_id = "shape-$order"
+                order = $order
+                contour = $shape.contour
+                holes = $shape.holes
+                area = [double]$shape.area
+                width = [double]$shape.width
+                height = [double]$shape.height
+                base_rotation_degrees = 0.0
+                two_sided = $false
+                special_shape = [bool]$shape.special_shape
+              }
+              $order++
+            }
+          }
+          $job = @{
+            protocol_version = 2
+            source = 'nesting.skp-363'
+            optimization_attempts = 56
+            materials = @(@{
+              key = 'bt100|17.4'
+              material = 'BT100'
+              thickness = 17.4
+              group_index = 0
+              original_part_count = $parts.Count
+              configuration = @{
+                board_width = 1220.0
+                board_height = 2440.0
+                edge_margin = 3.0
+                cut_gap = 8.0
+                rotation_divisions = 4
+                sheet_in_sheet = $false
+                priority_zone_nesting = $true
+                optimize_flip_face = $true
+                compact_directions = @('left','bottom')
+                max_nesting_time_ms = 300000
+              }
+              parts = $parts
+            })
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'mn_model_363'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $jobPath = Join-Path $dir 'job.json'
+          $resultPath = Join-Path $dir 'result.json'
+          $progressPath = Join-Path $dir 'progress.json'
+          $previewPath = Join-Path $dir 'preview.json'
+          $svgPath = Join-Path $dir 'result.svg'
+          $cancelPath = Join-Path $dir 'cancel.flag'
+          $job | ConvertTo-Json -Depth 100 -Compress | Set-Content -Encoding utf8NoBOM $jobPath
+          $exe = Resolve-Path 'target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe'
+          & $exe --job $jobPath --result $resultPath --progress $progressPath --preview $previewPath --svg $svgPath --cancel $cancelPath --workers 4
+          if ($LASTEXITCODE -ne 0) { throw "Engine exit $LASTEXITCODE" }
+          $result = Get-Content -Raw $resultPath | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Engine result is not ok' }
+          $layout = $result.layouts[0]
+          Write-Host "MODEL_363 sheets=$($layout.sheets.Count) utilization=$($layout.used_percent) first=$($layout.first_sheet_used_percent) elapsed_ms=$($layout.elapsed_ms) strategy=$($layout.solver_strategy)"
+          Copy-Item $resultPath "$env:GITHUB_WORKSPACE/model_363_result.json"
+          Copy-Item $svgPath "$env:GITHUB_WORKSPACE/model_363_result.svg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mn-model-363-v012-adaptive
+          path: |
+            model_363_result.json
+            model_363_result.svg
+            engine/build/work012/target/x86_64-pc-windows-msvc/release/mn_nesting_engine.exe
+          if-no-files-found: error

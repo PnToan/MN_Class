@@ -1,0 +1,24 @@
+--- src/engine.rs
++++ src/engine.rs
+@@ -836,7 +836,7 @@
+                 break;
+             }
+             let fixed = original.sheets[..cut].to_vec();
+-            let mut candidate = pack_subset_sheet_by_sheet(
++            let mut candidate = match pack_subset_sheet_by_sheet(
+                 parts,
+                 cfg,
+                 container,
+@@ -845,7 +845,11 @@
+                 variant,
+                 deadline,
+                 runner,
+-            )?;
++            ) {
++                Ok(candidate) => candidate,
++                Err(error) if error.to_string() == "TIMEOUT_TAIL_REPACK" => return Ok(()),
++                Err(error) => return Err(error),
++            };
+             candidate.strategy = format!("mn_tail_family_cut_{cut}_variant_{variant}");
+             candidate.attempt = variant;
+ 

@@ -1,0 +1,1 @@
+Optimizer 001: global sheet-cap search, tail-window repack, early-sheet fill objective, richer Jagua placement candidates, item holes support.
