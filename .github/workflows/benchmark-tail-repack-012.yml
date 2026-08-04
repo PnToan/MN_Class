@@ -34,6 +34,7 @@ jobs:
           patch -p0 --forward < ../../patches/tail_repack_012.patch
           patch -p0 --forward < ../../patches/tail_timeout_guard.patch
           patch -p0 --forward < ../../patches/stage_budget_012.patch
+          patch -p0 --forward < ../../patches/fast_tail_cycle_012.patch
 
       - uses: dtolnay/rust-toolchain@stable
         with:
